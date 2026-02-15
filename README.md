@@ -35,7 +35,7 @@ With **SolidJS Web**, you can quickly bootstrap a new SolidJS project that encou
 Ensure you have the following installed:
 
 - [Node.js](https://nodejs.org/) (LTS recommended)
-- [npm](https://www.npmjs.com/)
+- [pnpm](https://pnpm.io/)
 
 ### Local Generation
 
@@ -49,9 +49,9 @@ Ensure you have the following installed:
 
 3. **Run the following**
    ```bash
-   npm install
-   npm run build:prod
-   npm run build:dev
+   pnpm install
+   pnpm run build:prod
+   pnpm run build:dev
    ```
 
 ### Remote Generation
