@@ -2398,7 +2398,10 @@ return _$el${id};
     createComputed,
     createDeferred,
     createRenderEffect,
-    createResource
+    createResource,
+    mapArray,
+    batch,
+    createRoot
   };
   return SolidJS;
 }));

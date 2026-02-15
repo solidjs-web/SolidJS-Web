@@ -1,4 +1,4 @@
-import {createSignal, onMount, For, Switch, Match, createRoot, createEffect, createMemo, Show, onCleanup, createComputed, createDeferred, createRenderEffect, createResource} from 'solid-js';
+import { createSignal, onMount, For, Switch, Match, mapArray, batch, createRoot, createEffect, createMemo, Show, onCleanup, createComputed, createDeferred, createRenderEffect, createResource } from 'solid-js';
 import SolidHyper from 'solid-js/h';
 import SolidHTML from 'solid-js/html';
 import { insert } from "solid-js/web";
@@ -33,6 +33,9 @@ const SolidJS = {
     createDeferred,
     createRenderEffect,
     createResource,
+    mapArray,
+    batch,
+    createRoot
 }
 
 
