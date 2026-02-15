@@ -8,7 +8,8 @@ export default defineConfig({
         name: 'SolidJS',
         fileName: (format, entryName) => 'solid-js-dev.js',
         formats: ['umd']
-      }
+      },
+      emptyOutDir: false,
       // Default outDir is "dist"
       // You can customize other options if needed
     }

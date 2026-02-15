@@ -2,14 +2,14 @@
     "name": "solidjs-web",
     "version": "1.0.0",
     "scripts": {
-        "build:prod": "vite build -c vite.prod.config.mjs --outDir dist-prod",
-        "build:dev": "vite build -c vite.dev.config.mjs --outDir dist-dev"
+        "build:prod": "vite build -c vite.prod.config.mjs --outDir dist",
+        "build:dev": "vite build -c vite.dev.config.mjs --outDir dist"
     },
     "devDependencies": {
-        "hyper-dom-expressions": "0.39.4",
-        "lit-dom-expressions": "0.39.4",
+        "hyper-dom-expressions": "0.40.4",
+        "lit-dom-expressions": "0.40.4",
         "solid-element": "1.9.1",
-        "solid-js": "1.9.3",
-        "vite": "^6.0.3"
+        "solid-js": "1.9.11",
+        "vite": "^7.3.1"
     }
 }

@@ -1,8 +1,8 @@
 (function(global, factory) {
   typeof exports === "object" && typeof module !== "undefined" ? module.exports = factory() : typeof define === "function" && define.amd ? define(factory) : (global = typeof globalThis !== "undefined" ? globalThis : global || self, global.SolidJS = factory());
-})(this, function() {
+})(this, (function() {
   "use strict";
-  let taskIdCounter = 1, isCallbackScheduled = false, isPerformingWork = false, taskQueue = [], currentTask = null, shouldYieldToHost = null, yieldInterval = 5, deadline = 0, maxYieldInterval = 300, scheduleCallback = null, scheduledCallback = null;
+  let taskIdCounter = 1, isCallbackScheduled = false, isPerformingWork = false, taskQueue = [], currentTask = null, shouldYieldToHost = null, yieldInterval = 5, deadline = 0, maxYieldInterval = 300, maxDeadline = 0, scheduleCallback = null, scheduledCallback = null;
   const maxSigned31BitInt = 1073741823;
   function setupScheduler() {
     const channel = new MessageChannel(), port = channel.port2;
@@ -11,9 +11,9 @@
       if (scheduledCallback !== null) {
         const currentTime = performance.now();
         deadline = currentTime + yieldInterval;
-        const hasTimeRemaining = true;
+        maxDeadline = currentTime + maxYieldInterval;
         try {
-          const hasMoreWork = scheduledCallback(hasTimeRemaining, currentTime);
+          const hasMoreWork = scheduledCallback(currentTime);
           if (!hasMoreWork) {
             scheduledCallback = null;
           } else port.postMessage(null);
@@ -31,7 +31,7 @@
           if (scheduling.isInputPending()) {
             return true;
           }
-          return currentTime >= maxYieldInterval;
+          return currentTime >= maxDeadline;
         } else {
           return false;
         }
@@ -73,21 +73,21 @@
     }
     return newTask;
   }
-  function flushWork(hasTimeRemaining, initialTime) {
+  function flushWork(initialTime) {
     isCallbackScheduled = false;
     isPerformingWork = true;
     try {
-      return workLoop(hasTimeRemaining, initialTime);
+      return workLoop(initialTime);
     } finally {
       currentTask = null;
       isPerformingWork = false;
     }
   }
-  function workLoop(hasTimeRemaining, initialTime) {
+  function workLoop(initialTime) {
     let currentTime = initialTime;
     currentTask = taskQueue[0] || null;
     while (currentTask !== null) {
-      if (currentTask.expirationTime > currentTime && (!hasTimeRemaining || shouldYieldToHost())) {
+      if (currentTask.expirationTime > currentTime && shouldYieldToHost()) {
         break;
       }
       const callback = currentTask.fn;
@@ -104,10 +104,11 @@
     }
     return currentTask !== null;
   }
+  const IS_DEV = false;
   const equalFn = (a, b) => a === b;
-  const $PROXY = Symbol("solid-proxy");
+  const $PROXY = /* @__PURE__ */ Symbol("solid-proxy");
   const SUPPORTS_PROXY = typeof Proxy === "function";
-  const $TRACK = Symbol("solid-track");
+  const $TRACK = /* @__PURE__ */ Symbol("solid-track");
   const signalOptions = {
     equals: equalFn
   };
@@ -120,6 +121,7 @@
     context: null,
     owner: null
   };
+  const NO_INIT = {};
   var Owner = null;
   let Transition = null;
   let ExternalSourceConfig = null;
@@ -169,7 +171,8 @@
   }
   function createEffect(fn, value, options) {
     runEffects = runUserEffects;
-    const c = createComputation(fn, value, false, STALE);
+    const c = createComputation(fn, value, false, STALE), s = SuspenseContext && useContext(SuspenseContext);
+    if (s) c.suspense = s;
     if (!options || !options.render) c.user = true;
     Effects ? Effects.push(c) : updateComputation(c);
   }
@@ -182,30 +185,134 @@
     updateComputation(c);
     return readSignal.bind(c);
   }
+  function isPromise(v) {
+    return v && typeof v === "object" && "then" in v;
+  }
+  function createResource(pSource, pFetcher, pOptions) {
+    let source;
+    let fetcher;
+    let options;
+    if (typeof pFetcher === "function") {
+      source = pSource;
+      fetcher = pFetcher;
+      options = pOptions || {};
+    } else {
+      source = true;
+      fetcher = pSource;
+      options = pFetcher || {};
+    }
+    let pr = null, initP = NO_INIT, scheduled = false, resolved = "initialValue" in options, dynamic = typeof source === "function" && createMemo(source);
+    const contexts = /* @__PURE__ */ new Set(), [value, setValue] = (options.storage || createSignal)(options.initialValue), [error, setError] = createSignal(void 0), [track, trigger] = createSignal(void 0, {
+      equals: false
+    }), [state, setState] = createSignal(resolved ? "ready" : "unresolved");
+    function loadEnd(p, v, error2, key) {
+      if (pr === p) {
+        pr = null;
+        key !== void 0 && (resolved = true);
+        if ((p === initP || v === initP) && options.onHydrated) queueMicrotask(() => options.onHydrated(key, {
+          value: v
+        }));
+        initP = NO_INIT;
+        completeLoad(v, error2);
+      }
+      return v;
+    }
+    function completeLoad(v, err) {
+      runUpdates(() => {
+        if (err === void 0) setValue(() => v);
+        setState(err !== void 0 ? "errored" : resolved ? "ready" : "unresolved");
+        setError(err);
+        for (const c of contexts.keys()) c.decrement();
+        contexts.clear();
+      }, false);
+    }
+    function read() {
+      const c = SuspenseContext, v = value(), err = error();
+      if (err !== void 0 && !pr) throw err;
+      if (Listener && !Listener.user && c) ;
+      return v;
+    }
+    function load(refetching = true) {
+      if (refetching !== false && scheduled) return;
+      scheduled = false;
+      const lookup2 = dynamic ? dynamic() : source;
+      if (lookup2 == null || lookup2 === false) {
+        loadEnd(pr, untrack(value));
+        return;
+      }
+      let error2;
+      const p = initP !== NO_INIT ? initP : untrack(() => {
+        try {
+          return fetcher(lookup2, {
+            value: value(),
+            refetching
+          });
+        } catch (fetcherError) {
+          error2 = fetcherError;
+        }
+      });
+      if (error2 !== void 0) {
+        loadEnd(pr, void 0, castError(error2), lookup2);
+        return;
+      } else if (!isPromise(p)) {
+        loadEnd(pr, p, void 0, lookup2);
+        return p;
+      }
+      pr = p;
+      if ("v" in p) {
+        if (p.s === 1) loadEnd(pr, p.v, void 0, lookup2);
+        else loadEnd(pr, void 0, castError(p.v), lookup2);
+        return p;
+      }
+      scheduled = true;
+      queueMicrotask(() => scheduled = false);
+      runUpdates(() => {
+        setState(resolved ? "refreshing" : "pending");
+        trigger();
+      }, false);
+      return p.then((v) => loadEnd(p, v, void 0, lookup2), (e) => loadEnd(p, void 0, castError(e), lookup2));
+    }
+    Object.defineProperties(read, {
+      state: {
+        get: () => state()
+      },
+      error: {
+        get: () => error()
+      },
+      loading: {
+        get() {
+          const s = state();
+          return s === "pending" || s === "refreshing";
+        }
+      },
+      latest: {
+        get() {
+          if (!resolved) return read();
+          const err = error();
+          if (err && !pr) throw err;
+          return value();
+        }
+      }
+    });
+    let owner = Owner;
+    if (dynamic) createComputed(() => (owner = Owner, load(false)));
+    else load(false);
+    return [read, {
+      refetch: (info) => runWithOwner(owner, () => load(info)),
+      mutate: setValue
+    }];
+  }
   function createDeferred(source, options) {
     let t, timeout = options ? options.timeoutMs : void 0;
-    const node = createComputation(
-      () => {
-        if (!t || !t.fn)
-          t = requestCallback(
-            () => setDeferred(() => node.value),
-            timeout !== void 0 ? {
-              timeout
-            } : void 0
-          );
-        return source();
-      },
-      void 0,
-      true
-    );
-    const [deferred, setDeferred] = createSignal(
-      node.value,
-      options
-    );
+    const node = createComputation(() => {
+      if (!t || !t.fn) t = requestCallback(() => setDeferred(() => node.value), timeout !== void 0 ? {
+        timeout
+      } : void 0);
+      return source();
+    }, void 0, true);
+    const [deferred, setDeferred] = createSignal(node.value, options);
     updateComputation(node);
-    setDeferred(
-      () => node.value
-    );
+    setDeferred(() => node.value);
     return deferred;
   }
   function batch(fn) {
@@ -234,6 +341,25 @@
   function getListener() {
     return Listener;
   }
+  function runWithOwner(o, fn) {
+    const prev = Owner;
+    const prevListener = Listener;
+    Owner = o;
+    Listener = null;
+    try {
+      return runUpdates(fn, true);
+    } catch (err) {
+      handleError(err);
+    } finally {
+      Owner = prev;
+      Listener = prevListener;
+    }
+  }
+  const [transPending, setTransPending] = /* @__PURE__ */ createSignal(false);
+  function useContext(context) {
+    let value;
+    return Owner && Owner.context && (value = Owner.context[context.id]) !== void 0 ? value : context.defaultValue;
+  }
   function children(fn) {
     const children2 = createMemo(fn);
     const memo = createMemo(() => resolveChildren(children2()));
@@ -243,6 +369,7 @@
     };
     return memo;
   }
+  let SuspenseContext;
   function readSignal() {
     if (this.sources && this.state) {
       if (this.state === STALE) updateComputation(this);
@@ -291,7 +418,7 @@
           }
           if (Updates.length > 1e6) {
             Updates = [];
-            if (false) ;
+            if (IS_DEV) ;
             throw new Error();
           }
         }, false);
@@ -303,11 +430,7 @@
     if (!node.fn) return;
     cleanNode(node);
     const time = ExecCount;
-    runComputation(
-      node,
-      node.value,
-      time
-    );
+    runComputation(node, node.value, time);
   }
   function runComputation(node, value, time) {
     let nextValue;
@@ -425,8 +548,7 @@
       if (source.sources) {
         const state = source.state;
         if (state === STALE) {
-          if (source !== ignore && (!source.updatedAt || source.updatedAt < ExecCount))
-            runTop(source);
+          if (source !== ignore && (!source.updatedAt || source.updatedAt < ExecCount)) runTop(source);
         } else if (state === PENDING) lookUpstream(source, ignore);
       }
     }
@@ -493,7 +615,7 @@
     }
     return children2;
   }
-  const FALLBACK = Symbol("fallback");
+  const FALLBACK = /* @__PURE__ */ Symbol("fallback");
   function dispose(d) {
     for (let i = 0; i < d.length; i++) d[i]();
   }
@@ -633,29 +755,25 @@
       sources[i] = typeof s === "function" ? (proxy = true, createMemo(s)) : s;
     }
     if (SUPPORTS_PROXY && proxy) {
-      return new Proxy(
-        {
-          get(property) {
-            for (let i = sources.length - 1; i >= 0; i--) {
-              const v = resolveSource(sources[i])[property];
-              if (v !== void 0) return v;
-            }
-          },
-          has(property) {
-            for (let i = sources.length - 1; i >= 0; i--) {
-              if (property in resolveSource(sources[i])) return true;
-            }
-            return false;
-          },
-          keys() {
-            const keys = [];
-            for (let i = 0; i < sources.length; i++)
-              keys.push(...Object.keys(resolveSource(sources[i])));
-            return [...new Set(keys)];
+      return new Proxy({
+        get(property) {
+          for (let i = sources.length - 1; i >= 0; i--) {
+            const v = resolveSource(sources[i])[property];
+            if (v !== void 0) return v;
           }
         },
-        propTraps
-      );
+        has(property) {
+          for (let i = sources.length - 1; i >= 0; i--) {
+            if (property in resolveSource(sources[i])) return true;
+          }
+          return false;
+        },
+        keys() {
+          const keys = [];
+          for (let i = 0; i < sources.length; i++) keys.push(...Object.keys(resolveSource(sources[i])));
+          return [...new Set(keys)];
+        }
+      }, propTraps);
     }
     const sourcesMap = {};
     const defined = /* @__PURE__ */ Object.create(null);
@@ -700,69 +818,52 @@
   }
   function Show(props) {
     const keyed = props.keyed;
-    const condition = createMemo(() => props.when, void 0, {
-      equals: (a, b) => keyed ? a === b : !a === !b
+    const conditionValue = createMemo(() => props.when, void 0, void 0);
+    const condition = keyed ? conditionValue : createMemo(conditionValue, void 0, {
+      equals: (a, b) => !a === !b
     });
-    return createMemo(
-      () => {
-        const c = condition();
-        if (c) {
-          const child = props.children;
-          const fn = typeof child === "function" && child.length > 0;
-          return fn ? untrack(
-            () => child(
-              keyed ? c : () => {
-                if (!untrack(condition)) throw narrowedError("Show");
-                return props.when;
-              }
-            )
-          ) : child;
-        }
-        return props.fallback;
-      },
-      void 0,
-      void 0
-    );
+    return createMemo(() => {
+      const c = condition();
+      if (c) {
+        const child = props.children;
+        const fn = typeof child === "function" && child.length > 0;
+        return fn ? untrack(() => child(keyed ? c : () => {
+          if (!untrack(condition)) throw narrowedError("Show");
+          return conditionValue();
+        })) : child;
+      }
+      return props.fallback;
+    }, void 0, void 0);
   }
   function Switch(props) {
-    let keyed = false;
-    const equals = (a, b) => (keyed ? a[1] === b[1] : !a[1] === !b[1]) && a[2] === b[2];
-    const conditions = children(() => props.children), evalConditions = createMemo(
-      () => {
-        let conds = conditions();
-        if (!Array.isArray(conds)) conds = [conds];
-        for (let i = 0; i < conds.length; i++) {
-          const c = conds[i].when;
-          if (c) {
-            keyed = !!conds[i].keyed;
-            return [i, c, conds[i]];
-          }
-        }
-        return [-1];
-      },
-      void 0,
-      {
-        equals
+    const chs = children(() => props.children);
+    const switchFunc = createMemo(() => {
+      const ch = chs();
+      const mps = Array.isArray(ch) ? ch : [ch];
+      let func = () => void 0;
+      for (let i = 0; i < mps.length; i++) {
+        const index = i;
+        const mp = mps[i];
+        const prevFunc = func;
+        const conditionValue = createMemo(() => prevFunc() ? void 0 : mp.when, void 0, void 0);
+        const condition = mp.keyed ? conditionValue : createMemo(conditionValue, void 0, {
+          equals: (a, b) => !a === !b
+        });
+        func = () => prevFunc() || (condition() ? [index, conditionValue, mp] : void 0);
       }
-    );
-    return createMemo(
-      () => {
-        const [index, when, cond] = evalConditions();
-        if (index < 0) return props.fallback;
-        const c = cond.children;
-        const fn = typeof c === "function" && c.length > 0;
-        return fn ? untrack(
-          () => c(
-            keyed ? when : () => {
-              if (untrack(evalConditions)[0] !== index) throw narrowedError("Match");
-              return cond.when;
-            }
-          )
-        ) : c;
-      },
-      void 0,
-      void 0
-    );
+      return func;
+    });
+    return createMemo(() => {
+      const sel = switchFunc()();
+      if (!sel) return props.fallback;
+      const [index, conditionValue, mp] = sel;
+      const child = mp.children;
+      const fn = typeof child === "function" && child.length > 0;
+      return fn ? untrack(() => child(mp.keyed ? conditionValue() : () => {
+        if (untrack(switchFunc)()?.[0] !== index) throw narrowedError("Match");
+        return conditionValue();
+      })) : child;
+    }, void 0, void 0);
   }
   function Match(props) {
     return props;
@@ -770,6 +871,7 @@
   const booleans = [
     "allowfullscreen",
     "async",
+    "alpha",
     "autofocus",
     "autoplay",
     "checked",
@@ -792,30 +894,59 @@
     "required",
     "reversed",
     "seamless",
-    "selected"
+    "selected",
+    "adauctionheaders",
+    "browsingtopics",
+    "credentialless",
+    "defaultchecked",
+    "defaultmuted",
+    "defaultselected",
+    "defer",
+    "disablepictureinpicture",
+    "disableremoteplayback",
+    "preservespitch",
+    "shadowrootclonable",
+    "shadowrootcustomelementregistry",
+    "shadowrootdelegatesfocus",
+    "shadowrootserializable",
+    "sharedstoragewritable"
   ];
   const Properties = /* @__PURE__ */ new Set([
     "className",
     "value",
     "readOnly",
+    "noValidate",
     "formNoValidate",
     "isMap",
     "noModule",
     "playsInline",
+    "adAuctionHeaders",
+    "allowFullscreen",
+    "browsingTopics",
+    "defaultChecked",
+    "defaultMuted",
+    "defaultSelected",
+    "disablePictureInPicture",
+    "disableRemotePlayback",
+    "preservesPitch",
+    "shadowRootClonable",
+    "shadowRootCustomElementRegistry",
+    "shadowRootDelegatesFocus",
+    "shadowRootSerializable",
+    "sharedStorageWritable",
     ...booleans
   ]);
-  const ChildProperties = /* @__PURE__ */ new Set([
-    "innerHTML",
-    "textContent",
-    "innerText",
-    "children"
-  ]);
+  const ChildProperties = /* @__PURE__ */ new Set(["innerHTML", "textContent", "innerText", "children"]);
   const Aliases = /* @__PURE__ */ Object.assign(/* @__PURE__ */ Object.create(null), {
     className: "class",
     htmlFor: "for"
   });
   const PropAliases = /* @__PURE__ */ Object.assign(/* @__PURE__ */ Object.create(null), {
     class: "className",
+    novalidate: {
+      $: "noValidate",
+      FORM: 1
+    },
     formnovalidate: {
       $: "formNoValidate",
       BUTTON: 1,
@@ -837,36 +968,69 @@
       $: "readOnly",
       INPUT: 1,
       TEXTAREA: 1
+    },
+    adauctionheaders: {
+      $: "adAuctionHeaders",
+      IFRAME: 1
+    },
+    allowfullscreen: {
+      $: "allowFullscreen",
+      IFRAME: 1
+    },
+    browsingtopics: {
+      $: "browsingTopics",
+      IMG: 1
+    },
+    defaultchecked: {
+      $: "defaultChecked",
+      INPUT: 1
+    },
+    defaultmuted: {
+      $: "defaultMuted",
+      AUDIO: 1,
+      VIDEO: 1
+    },
+    defaultselected: {
+      $: "defaultSelected",
+      OPTION: 1
+    },
+    disablepictureinpicture: {
+      $: "disablePictureInPicture",
+      VIDEO: 1
+    },
+    disableremoteplayback: {
+      $: "disableRemotePlayback",
+      AUDIO: 1,
+      VIDEO: 1
+    },
+    preservespitch: {
+      $: "preservesPitch",
+      AUDIO: 1,
+      VIDEO: 1
+    },
+    shadowrootclonable: {
+      $: "shadowRootClonable",
+      TEMPLATE: 1
+    },
+    shadowrootdelegatesfocus: {
+      $: "shadowRootDelegatesFocus",
+      TEMPLATE: 1
+    },
+    shadowrootserializable: {
+      $: "shadowRootSerializable",
+      TEMPLATE: 1
+    },
+    sharedstoragewritable: {
+      $: "sharedStorageWritable",
+      IFRAME: 1,
+      IMG: 1
     }
   });
   function getPropAlias(prop, tagName2) {
     const a = PropAliases[prop];
     return typeof a === "object" ? a[tagName2] ? a["$"] : void 0 : a;
   }
-  const DelegatedEvents = /* @__PURE__ */ new Set([
-    "beforeinput",
-    "click",
-    "dblclick",
-    "contextmenu",
-    "focusin",
-    "focusout",
-    "input",
-    "keydown",
-    "keyup",
-    "mousedown",
-    "mousemove",
-    "mouseout",
-    "mouseover",
-    "mouseup",
-    "pointerdown",
-    "pointermove",
-    "pointerout",
-    "pointerover",
-    "pointerup",
-    "touchend",
-    "touchmove",
-    "touchstart"
-  ]);
+  const DelegatedEvents = /* @__PURE__ */ new Set(["beforeinput", "click", "dblclick", "contextmenu", "focusin", "focusout", "input", "keydown", "keyup", "mousedown", "mousemove", "mouseout", "mouseover", "mouseup", "pointerdown", "pointermove", "pointerout", "pointerover", "pointerup", "touchend", "touchmove", "touchstart"]);
   const SVGElements = /* @__PURE__ */ new Set([
     "altGlyph",
     "altGlyphDef",
@@ -1076,9 +1240,7 @@
   function spread(node, props = {}, isSVG, skipChildren) {
     const prevProps = {};
     if (!skipChildren) {
-      createRenderEffect(
-        () => prevProps.children = insertExpression(node, props.children, prevProps.children)
-      );
+      createRenderEffect(() => prevProps.children = insertExpression(node, props.children, prevProps.children));
     }
     createRenderEffect(() => typeof props.ref === "function" && use(props.ref, node));
     createRenderEffect(() => assign(node, props, isSVG, true, prevProps, true));
@@ -1124,8 +1286,7 @@
   }
   function toggleClassKey(node, key, value) {
     const classNames = key.trim().split(/\s+/);
-    for (let i = 0, nameLen = classNames.length; i < nameLen; i++)
-      node.classList.toggle(classNames[i], value);
+    for (let i = 0, nameLen = classNames.length; i < nameLen; i++) node.classList.toggle(classNames[i], value);
   }
   function assignProp(node, prop, value, prev, isSVG, skipRef, props) {
     let isCE, isProp, isChildProp, propAlias, forceProp;
@@ -1290,11 +1451,7 @@
       } else if (t === "function") {
         if (unwrap2) {
           while (typeof item === "function") item = item();
-          dynamic = normalizeIncomingArray(
-            normalized,
-            Array.isArray(item) ? item : [item],
-            Array.isArray(prev) ? prev : [prev]
-          ) || dynamic;
+          dynamic = normalizeIncomingArray(normalized, Array.isArray(item) ? item : [item], Array.isArray(prev) ? prev : [prev]) || dynamic;
         } else {
           normalized.push(item);
           dynamic = true;
@@ -1319,15 +1476,14 @@
         const el = current[i];
         if (node !== el) {
           const isParent = el.parentNode === parent;
-          if (!inserted && !i)
-            isParent ? parent.replaceChild(node, el) : parent.insertBefore(node, marker2);
+          if (!inserted && !i) isParent ? parent.replaceChild(node, el) : parent.insertBefore(node, marker2);
           else isParent && el.remove();
         } else inserted = true;
       }
     } else parent.insertBefore(node, marker2);
     return [node];
   }
-  const $ELEMENT = Symbol("hyper-element");
+  const $ELEMENT = /* @__PURE__ */ Symbol("hyper-element");
   function createHyperScript(r) {
     function h2() {
       let args = [].slice.call(arguments), e, classes = [], multiExpression = false;
@@ -1374,8 +1530,7 @@
         } else if ("function" === type) {
           if (!e) {
             let props, next = args[0];
-            if (next == null || typeof next === "object" && !Array.isArray(next) && !(next instanceof Element))
-              props = args.shift();
+            if (next == null || typeof next === "object" && !Array.isArray(next) && !(next instanceof Element)) props = args.shift();
             props || (props = {});
             if (args.length) {
               props.children = args.length > 1 ? args : args[0];
@@ -1391,8 +1546,7 @@
                   return list;
                 };
                 r.dynamicProperty(props, k);
-              } else if (typeof d[k].value === "function" && !d[k].value.length)
-                r.dynamicProperty(props, k);
+              } else if (typeof d[k].value === "function" && !d[k].value.length) r.dynamicProperty(props, k);
             }
             e = r.createComponent(l, props);
             args = [];
@@ -1408,8 +1562,7 @@
         for (let i = 0; i < m.length; i++) {
           const v = m[i], s = v.substring(1, v.length);
           if (!v) continue;
-          if (!e)
-            e = r.SVGElements.has(v) ? document.createElementNS("http://www.w3.org/2000/svg", v) : document.createElement(v);
+          if (!e) e = r.SVGElements.has(v) ? document.createElementNS("http://www.w3.org/2000/svg", v) : document.createElement(v);
           else if (v[0] === ".") classes.push(s);
           else if (v[0] === "#") e.setAttribute("id", s);
         }
@@ -1599,10 +1752,7 @@
   const tagName = "<([A-Za-z$#]+[A-Za-z0-9:_-]*)((?:";
   const attrPartials = `(?:\\s*=\\s*(?:'[^']*?'|"[^"]*?"|\\([^)]*?\\)|<[^>]*?>|` + almostEverything + "))?)";
   const attrSeeker = new RegExp(tagName + attrName + attrPartials + "+)([ " + spaces + "]*/?>)", "g");
-  const findAttributes = new RegExp(
-    "(" + attrName + `\\s*=\\s*)(<!--#-->|['"(]([\\w\\s]*<!--#-->[\\w\\s]*)*['")])`,
-    "gi"
-  );
+  const findAttributes = new RegExp("(" + attrName + `\\s*=\\s*)(<!--#-->|['"(]([\\w\\s]*<!--#-->[\\w\\s]*)*['")])`, "gi");
   const selfClosing = new RegExp(tagName + attrName + attrPartials + "*)([ " + spaces + "]*/>)", "g");
   const marker = "<!--#-->";
   const reservedNameSpaces = /* @__PURE__ */ new Set(["class", "on", "oncapture", "style", "use", "prop", "attr"]);
@@ -1621,14 +1771,15 @@
   function parseDirective(name, value, tag, options) {
     if (name === "use:###" && value === "###") {
       const count = options.counter++;
-      options.exprs.push(
-        `typeof exprs[${count}] === "function" ? r.use(exprs[${count}], ${tag}, exprs[${options.counter++}]) : (()=>{throw new Error("use:### must be a function")})()`
-      );
+      options.exprs.push(`typeof exprs[${count}] === "function" ? r.use(exprs[${count}], ${tag}, exprs[${options.counter++}]) : (()=>{throw new Error("use:### must be a function")})()`);
     } else {
       throw new Error(`Not support syntax ${name} must be use:{function}`);
     }
   }
-  function createHTML(r, { delegateEvents: delegateEvents2 = true, functionBuilder = (...args) => new Function(...args) } = {}) {
+  function createHTML(r, {
+    delegateEvents: delegateEvents2 = true,
+    functionBuilder = (...args) => new Function(...args)
+  } = {}) {
     let uuid = 1;
     r.wrapProps = (props) => {
       const d = Object.getOwnPropertyDescriptors(props);
@@ -1638,22 +1789,12 @@
       return props;
     };
     function createTemplate(statics, opt) {
-      var _a;
       let i = 0, markup = "";
       for (; i < statics.length - 1; i++) {
         markup = markup + statics[i] + "<!--#-->";
       }
       markup = markup + statics[i];
-      const replaceList = [
-        [selfClosing, fullClosing],
-        [/<(<!--#-->)/g, "<###"],
-        [/\.\.\.(<!--#-->)/g, "###"],
-        [attrSeeker, attrReplacer],
-        [/>\n+\s*/g, ">"],
-        [/\n+\s*</g, "<"],
-        [/\s+</g, " <"],
-        [/>\s+/g, "> "]
-      ];
+      const replaceList = [[selfClosing, fullClosing], [/<(<!--#-->)/g, "<###"], [/\.\.\.(<!--#-->)/g, "###"], [attrSeeker, attrReplacer], [/>\n+\s*/g, ">"], [/\n+\s*</g, "<"], [/\s+</g, " <"], [/>\s+/g, "> "]];
       markup = replaceList.reduce((acc, x) => {
         return acc.replace(x[0], x[1]);
       }, markup);
@@ -1664,7 +1805,7 @@
         templates[i2].innerHTML = html3[i2];
         const nomarkers = templates[i2].content.querySelectorAll("script,style");
         for (let j = 0; j < nomarkers.length; j++) {
-          const d = ((_a = nomarkers[j].firstChild) == null ? void 0 : _a.data) || "";
+          const d = nomarkers[j].firstChild?.data || "";
           if (d.indexOf(marker) > -1) {
             const parts = d.split(marker).reduce((memo, p, i3) => {
               i3 && memo.push("");
@@ -1680,9 +1821,7 @@
       return templates;
     }
     function parseKeyValue(node, tag, name, value, isSVG, isCE, options) {
-      let expr = value === "###" ? `!doNotWrap ? exprs[${options.counter}]() : exprs[${options.counter++}]` : value.split("###").map(
-        (v, i) => i ? ` + (typeof exprs[${options.counter}] === "function" ? exprs[${options.counter}]() : exprs[${options.counter++}]) + "${v}"` : `"${v}"`
-      ).join(""), parts, namespace;
+      let expr = value === "###" ? `!doNotWrap ? exprs[${options.counter}]() : exprs[${options.counter++}]` : value.split("###").map((v, i) => i ? ` + (typeof exprs[${options.counter}] === "function" ? exprs[${options.counter}]() : exprs[${options.counter++}]) + "${v}"` : `"${v}"`).join(""), parts, namespace;
       if ((parts = name.split(":")) && parts[1] && reservedNameSpaces.has(parts[0])) {
         name = parts[1];
         namespace = parts[0];
@@ -1699,9 +1838,7 @@
         options.exprs.push(`r.classList(${tag},${expr},${prev})`);
       } else if (namespace !== "attr" && (isChildProp || !isSVG && (r.getPropAlias(name, node.name.toUpperCase()) || isProp) || isCE || namespace === "prop")) {
         if (isCE && !isChildProp && !isProp && namespace !== "prop") name = toPropertyName(name);
-        options.exprs.push(
-          `${tag}.${r.getPropAlias(name, node.name.toUpperCase()) || name} = ${expr}`
-        );
+        options.exprs.push(`${tag}.${r.getPropAlias(name, node.name.toUpperCase()) || name} = ${expr}`);
       } else {
         const ns = isSVG && name.indexOf(":") > -1 && r.SVGNamespace[name.split(":")[0]];
         if (ns) options.exprs.push(`r.setAttributeNS(${tag},"${ns}","${name}",${expr})`);
@@ -1713,15 +1850,11 @@
         if (!name.includes(":")) {
           const lc = name.slice(2).toLowerCase();
           const delegate = delegateEvents2 && r.DelegatedEvents.has(lc);
-          options.exprs.push(
-            `r.addEventListener(${tag},"${lc}",exprs[${options.counter++}],${delegate})`
-          );
+          options.exprs.push(`r.addEventListener(${tag},"${lc}",exprs[${options.counter++}],${delegate})`);
           delegate && options.delegatedEvents.add(lc);
         } else {
           let capture = name.startsWith("oncapture:");
-          options.exprs.push(
-            `${tag}.addEventListener("${name.slice(capture ? 10 : 3)}",exprs[${options.counter++}]${capture ? ",true" : ""})`
-          );
+          options.exprs.push(`${tag}.addEventListener("${name.slice(capture ? 10 : 3)}",exprs[${options.counter++}]${capture ? ",true" : ""})`);
         }
       } else if (name === "ref") {
         options.exprs.push(`exprs[${options.counter++}](${tag})`);
@@ -1730,17 +1863,11 @@
           exprs: []
         }), count = options.counter;
         parseKeyValue(node, tag, name, value, isSVG, isCE, childOptions);
-        options.decl.push(
-          `_fn${count} = (${value === "###" ? "doNotWrap" : ""}) => {
-${childOptions.exprs.join(
-            ";\n"
-          )};
-}`
-        );
+        options.decl.push(`_fn${count} = (${value === "###" ? "doNotWrap" : ""}) => {
+${childOptions.exprs.join(";\n")};
+}`);
         if (value === "###") {
-          options.exprs.push(
-            `typeof exprs[${count}] === "function" ? r.effect(_fn${count}) : _fn${count}(true)`
-          );
+          options.exprs.push(`typeof exprs[${count}] === "function" ? r.effect(_fn${count}) : _fn${count}(true)`);
         } else {
           let check = "";
           for (let i = count; i < childOptions.counter; i++) {
@@ -1783,8 +1910,7 @@ ${childOptions.exprs.join(
           continue;
         }
         parseNode(child, childOptions);
-        if (!childOptions.multi && child.type === "comment" && child.content === "#")
-          node.children.splice(i, 1);
+        if (!childOptions.multi && child.type === "comment" && child.content === "#") node.children.splice(i, 1);
         else i++;
       }
       options.counter = childOptions.counter;
@@ -1806,20 +1932,22 @@ ${childOptions.exprs.join(
       let props = [];
       const keys = Object.keys(node.attrs), propGroups = [props], componentIdentifier = options.counter++;
       for (let i = 0; i < keys.length; i++) {
-        const { type, name, value } = node.attrs[i];
+        const {
+          type,
+          name,
+          value
+        } = node.attrs[i];
         if (type === "attr") {
           if (name === "###") {
             propGroups.push(`exprs[${options.counter++}]`);
             propGroups.push(props = []);
           } else if (value === "###") {
-            props.push(`${name}: exprs[${options.counter++}]`);
-          } else props.push(`${name}: "${value}"`);
+            props.push(`"${name}": exprs[${options.counter++}]`);
+          } else props.push(`"${name}": "${value}"`);
         } else if (type === "directive") {
           const tag2 = `_$el${uuid++}`;
           const topDecl = !options.decl.length;
-          options.decl.push(
-            topDecl ? "" : `${tag2} = ${options.path}.${options.first ? "firstChild" : "nextSibling"}`
-          );
+          options.decl.push(topDecl ? "" : `${tag2} = ${options.path}.${options.first ? "firstChild" : "nextSibling"}`);
           parseDirective(name, value, tag2, options);
         }
       }
@@ -1845,14 +1973,8 @@ ${childOptions.exprs.join(
         tag = `_$el${uuid++}`;
         options.decl.push(`${tag} = ${options.path}.${options.first ? "firstChild" : "nextSibling"}`);
       }
-      if (options.parent)
-        options.exprs.push(
-          `r.insert(${options.parent}, r.createComponent(exprs[${componentIdentifier}],${processComponentProps(propGroups)})${tag ? `, ${tag}` : ""})`
-        );
-      else
-        options.exprs.push(
-          `${options.fragment ? "" : "return "}r.createComponent(exprs[${componentIdentifier}],${processComponentProps(propGroups)})`
-        );
+      if (options.parent) options.exprs.push(`r.insert(${options.parent}, r.createComponent(exprs[${componentIdentifier}],${processComponentProps(propGroups)})${tag ? `, ${tag}` : ""})`);
+      else options.exprs.push(`${options.fragment ? "" : "return "}r.createComponent(exprs[${componentIdentifier}],${processComponentProps(propGroups)})`);
       options.path = tag;
       options.first = false;
     }
@@ -1883,11 +2005,9 @@ ${childOptions.exprs.join(
             });
             options.templateNodes.push([child]);
             parseNode(child, childOptions);
-            parts.push(
-              `function() { ${childOptions.decl.join(",\n") + ";\n" + childOptions.exprs.join(";\n") + `;
+            parts.push(`function() { ${childOptions.decl.join(",\n") + ";\n" + childOptions.exprs.join(";\n") + `;
 return _$el${id};
-`}}()`
-            );
+`}}()`);
             options.counter = childOptions.counter;
             options.templateId = childOptions.templateId;
           } else if (child.type === "text") {
@@ -1906,9 +2026,7 @@ return _$el${id};
         const tag = `_$el${uuid++}`;
         const topDecl = !options.decl.length;
         const templateId = options.templateId;
-        options.decl.push(
-          topDecl ? "" : `${tag} = ${options.path}.${options.first ? "firstChild" : "nextSibling"}`
-        );
+        options.decl.push(topDecl ? "" : `${tag} = ${options.path}.${options.first ? "firstChild" : "nextSibling"}`);
         const isSVG = r.SVGElements.has(node.name);
         const isCE = node.name.includes("-") || node.attrs.some((e) => e.name === "is");
         options.hasCustomElement = isCE;
@@ -1918,7 +2036,11 @@ return _$el${id};
           let current = "";
           const newAttrs = [];
           for (let i = 0; i < node.attrs.length; i++) {
-            const { type, name, value } = node.attrs[i];
+            const {
+              type,
+              name,
+              value
+            } = node.attrs[i];
             if (type === "attr") {
               if (value.includes("###")) {
                 let count = options.counter++;
@@ -1940,12 +2062,14 @@ return _$el${id};
           if (current.length) {
             spreadArgs.push(`()=>({${current}})`);
           }
-          options.exprs.push(
-            `r.spread(${tag},${spreadArgs.length === 1 ? `typeof ${spreadArgs[0]} === "function" ? r.mergeProps(${spreadArgs[0]}) : ${spreadArgs[0]}` : `r.mergeProps(${spreadArgs.join(",")})`},${isSVG},${!!node.children.length})`
-          );
+          options.exprs.push(`r.spread(${tag},${spreadArgs.length === 1 ? `typeof ${spreadArgs[0]} === "function" ? r.mergeProps(${spreadArgs[0]}) : ${spreadArgs[0]}` : `r.mergeProps(${spreadArgs.join(",")})`},${isSVG},${!!node.children.length})`);
         } else {
           for (let i = 0; i < node.attrs.length; i++) {
-            const { type, name, value } = node.attrs[i];
+            const {
+              type,
+              name,
+              value
+            } = node.attrs[i];
             if (type === "directive") {
               parseDirective(name, value, tag, options);
               node.attrs.splice(i, 1);
@@ -1996,12 +2120,10 @@ return _$el${id};
       }, id = uuid, origNodes = nodes;
       let toplevel;
       if (nodes.length > 1) {
-        nodes = [
-          {
-            type: "fragment",
-            children: nodes
-          }
-        ];
+        nodes = [{
+          type: "fragment",
+          children: nodes
+        }];
       }
       if (nodes[0].name === "###") {
         toplevel = true;
@@ -2009,17 +2131,9 @@ return _$el${id};
       } else parseNode(nodes[0], options);
       r.delegateEvents(Array.from(options.delegatedEvents));
       const templateNodes = [origNodes].concat(options.templateNodes);
-      return [
-        templateNodes.map((t) => stringify(t)),
-        funcBuilder(
-          "tmpls",
-          "exprs",
-          "r",
-          options.decl.join(",\n") + ";\n" + options.exprs.join(";\n") + (toplevel ? "" : `;
+      return [templateNodes.map((t) => stringify(t)), funcBuilder("tmpls", "exprs", "r", options.decl.join(",\n") + ";\n" + options.exprs.join(";\n") + (toplevel ? "" : `;
 return _$el${id};
-`)
-        )
-      ];
+`))];
     }
     function html2(statics, ...args) {
       const templates = cache.get(statics) || createTemplate(statics, {
@@ -2051,7 +2165,7 @@ return _$el${id};
     SVGElements,
     SVGNamespace
   });
-  const $RAW = Symbol("store-raw"), $NODE = Symbol("store-node"), $HAS = Symbol("store-has"), $SELF = Symbol("store-self");
+  const $RAW = /* @__PURE__ */ Symbol("store-raw"), $NODE = /* @__PURE__ */ Symbol("store-node"), $HAS = /* @__PURE__ */ Symbol("store-has"), $SELF = /* @__PURE__ */ Symbol("store-self");
   function wrap$1(value) {
     let p = value[$PROXY];
     if (!p) {
@@ -2103,10 +2217,9 @@ return _$el${id};
   }
   function getNodes(target, symbol) {
     let nodes = target[symbol];
-    if (!nodes)
-      Object.defineProperty(target, symbol, {
-        value: nodes = /* @__PURE__ */ Object.create(null)
-      });
+    if (!nodes) Object.defineProperty(target, symbol, {
+      value: nodes = /* @__PURE__ */ Object.create(null)
+    });
     return nodes;
   }
   function getNode(nodes, property, value) {
@@ -2120,8 +2233,7 @@ return _$el${id};
   }
   function proxyDescriptor$1(target, property) {
     const desc = Reflect.getOwnPropertyDescriptor(target, property);
-    if (!desc || desc.get || !desc.configurable || property === $PROXY || property === $NODE)
-      return desc;
+    if (!desc || desc.get || !desc.configurable || property === $PROXY || property === $NODE) return desc;
     delete desc.value;
     delete desc.writable;
     desc.get = () => target[$PROXY][property];
@@ -2148,14 +2260,12 @@ return _$el${id};
       if (property === $NODE || property === $HAS || property === "__proto__") return value;
       if (!tracked) {
         const desc = Object.getOwnPropertyDescriptor(target, property);
-        if (getListener() && (typeof value !== "function" || target.hasOwnProperty(property)) && !(desc && desc.get))
-          value = getNode(nodes, property, value)();
+        if (getListener() && (typeof value !== "function" || target.hasOwnProperty(property)) && !(desc && desc.get)) value = getNode(nodes, property, value)();
       }
       return isWrappable(value) ? wrap$1(value) : value;
     },
     has(target, property) {
-      if (property === $RAW || property === $PROXY || property === $TRACK || property === $NODE || property === $HAS || property === "__proto__")
-        return true;
+      if (property === $RAW || property === $PROXY || property === $TRACK || property === $NODE || property === $HAS || property === "__proto__") return true;
       getListener() && getNode(getNodes(target, $HAS), property)();
       return property in target;
     },
@@ -2222,7 +2332,11 @@ return _$el${id};
         }
         return;
       } else if (isArray && partType === "object") {
-        const { from = 0, to = current.length - 1, by = 1 } = part;
+        const {
+          from = 0,
+          to = current.length - 1,
+          by = 1
+        } = part;
         for (let i = from; i <= to; i += by) {
           updatePath(current, [i].concat(path), traversed);
         }
@@ -2283,7 +2397,8 @@ return _$el${id};
     onCleanup,
     createComputed,
     createDeferred,
-    createRenderEffect
+    createRenderEffect,
+    createResource
   };
   return SolidJS;
-});
+}));
